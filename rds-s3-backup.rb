@@ -8,8 +8,6 @@ require 'logger'
 
 
 class RdsS3Backup < Thor
-  
-  desc "s3_dump", "Runs a mysqldump from a restored snapshot of the specified RDS instance, and uploads the dump to S3"
   method_option :rds_instance_id
   method_option :s3_bucket
   method_option :s3_prefix, :default => 'db_dumps'
@@ -24,60 +22,22 @@ class RdsS3Backup < Thor
   method_option :aws_region, :default => "us-east-1", :desc => "Region of your RDS server (and S3 storage, unless aws-s3-region is specified)."
   method_option :aws_s3_region, :desc => "Region to store your S3 dumpfiles, if different from the RDS region"
 
+  desc "local_export", "Runs a mysqldump from a restored snapshot of the specified RDS instance, and saves the dump locally"
+  def local_export
+    my_options = build_configuration(options)
+    backup_file_filepath = do_export(my_options)
+  end
+  
+  desc "s3_dump", "Runs a mysqldump from a restored snapshot of the specified RDS instance, and uploads the dump to S3"
   def s3_dump
     my_options = build_configuration(options)
+    backup_file_filepath = do_export(my_options)
     
-    rds        = Fog::AWS::RDS.new(:aws_access_key_id => my_options[:aws_access_key_id], 
-                                   :aws_secret_access_key => my_options[:aws_secret_access_key],
-                                   :region => my_options[:aws_region])
-
-    rds_server = rds.servers.get(my_options[:rds_instance_id])
-    s3         = Fog::Storage.new(:provider => 'AWS', 
-                                  :aws_access_key_id => my_options[:aws_access_key_id], 
-                                  :aws_secret_access_key => my_options[:aws_secret_access_key], 
-                                  :region => my_options[:aws_s3_region] || my_options[:aws_region],
-                                  :scheme => 'https')
-
     s3_bucket  = s3.directories.get(my_options[:s3_bucket])
-
-    snap_timestamp   = Time.now.strftime('%Y-%m-%d-%H-%M-%S-%Z')
-    snap_name        = "s3-dump-snap-#{snap_timestamp}"
-    backup_server_id = "#{rds_server.id}-s3-dump-server"
-
-    backup_file_name     = "#{rds_server.id}-mysqldump-#{snap_timestamp}.sql.gz"
-    backup_file_filepath = File.join(my_options[:dump_directory], backup_file_name)
-    
-    rds_server.snapshots.new(:id => snap_name).save
-    new_snap = rds_server.snapshots.get(snap_name)
-
-    # these double wait_fors look weird, but I've had ready? lie to me.
-    new_snap.wait_for { ready? }
-    new_snap.wait_for { ready? }
-
-    rds.restore_db_instance_from_db_snapshot(new_snap.id, backup_server_id)
-    backup_server = rds.servers.get(backup_server_id)
-    backup_server.wait_for { ready? }
-    backup_server.wait_for { ready? }
-
-    mysqldump_command = Cocaine::CommandLine.new('mysqldump',
-      '--opt --add-drop-table --single-transaction --order-by-primary -h :host_address -u :mysql_username --password=:mysql_password :mysql_database | gzip --fast -c > :backup_filepath', 
-      :host_address    => backup_server.endpoint['Address'], 
-      :mysql_username  => my_options[:mysql_username], 
-      :mysql_password  => my_options[:mysql_password], 
-      :mysql_database  => my_options[:mysql_database], 
-      :backup_filepath => backup_file_filepath,
-      :logger          => Logger.new(STDOUT))
-    
-    begin
-      mysqldump_command.run
-    rescue Cocaine::ExitStatusError, Cocaine::CommandNotFoundError => e
-      puts "Dump failed with error #{e.message}"
-      cleanup(new_snap, backup_server, backup_file_filepath)
-      exit(1)
-    end
     
     tries = 1
     saved_dump = begin
+      puts 'uploading to s3...'
       s3_bucket.files.new(:key => File.join(my_options[:s3_prefix], backup_file_name), 
                            :body => File.open(backup_file_filepath), 
                            :acl => 'private', 
@@ -101,11 +61,67 @@ class RdsS3Backup < Thor
     else
       puts "S3 upload failed!"                        
     end
-
-    cleanup(new_snap, backup_server, backup_file_filepath)
+    
+    File.unlink(backup_file_filepath)
   end
   
   no_tasks do
+    def do_export(my_options)
+      rds        = Fog::AWS::RDS.new(:aws_access_key_id => my_options[:aws_access_key_id], 
+                                     :aws_secret_access_key => my_options[:aws_secret_access_key],
+                                     :region => my_options[:aws_region])
+
+      rds_server = rds.servers.get(my_options[:rds_instance_id])
+      s3         = Fog::Storage.new(:provider => 'AWS', 
+                                    :aws_access_key_id => my_options[:aws_access_key_id], 
+                                    :aws_secret_access_key => my_options[:aws_secret_access_key], 
+                                    :region => my_options[:aws_s3_region] || my_options[:aws_region],
+                                    :scheme => 'https')
+
+      snap_timestamp   = Time.now.strftime('%Y-%m-%d-%H-%M-%S-%Z')
+      snap_name        = "s3-dump-snap-#{snap_timestamp}"
+      backup_server_id = "#{rds_server.id}-s3-dump-server"
+
+      backup_file_name     = "#{rds_server.id}-mysqldump-#{snap_timestamp}.sql.gz"
+      backup_file_filepath = File.join(my_options[:dump_directory], backup_file_name)
+    
+      puts 'creating db instance...'
+      rds.restore_db_instance_to_point_in_time(rds_server.id, backup_server_id,
+        'DBInstanceClass' => my_options[:db_instance_class],
+        'UseLatestRestorableTime' => true,
+        'MultiAz' => false,
+        'AvailabilityZone' => my_options[:db_az])
+
+      backup_server = rds.servers.get(backup_server_id)
+      
+      puts 'waiting for db instance to be ready...'
+      backup_server.wait_for { ready? }
+      backup_server.wait_for { ready? }
+
+      mysqldump_command = Cocaine::CommandLine.new('mysqldump',
+        "--opt --add-drop-table --single-transaction --order-by-primary -h :host_address -u :mysql_username --password=:mysql_password :mysql_database | gzip --fast -c > :backup_filepath")
+    
+      begin
+        puts 'running mysqldump...'
+        mysqldump_command.run(     
+          :host_address    => backup_server.endpoint['Address'], 
+          :mysql_username  => my_options[:mysql_username], 
+          :mysql_password  => my_options[:mysql_password], 
+          :mysql_database  => my_options[:mysql_database], 
+          :backup_filepath => backup_file_filepath,
+          :logger          => Logger.new(STDOUT))
+      rescue Cocaine::ExitStatusError, Cocaine::CommandNotFoundError => e
+        puts "Dump failed with error #{e.message}"
+        File.unlink(backup_file_filepath)
+        cleanup(backup_server)
+        exit(1)
+      end
+    
+      puts 'cleaning up...'
+      cleanup(backup_server)
+      backup_file_filepath
+    end
+    
     def build_configuration(thor_options)
       merged_options = {}
       begin
@@ -120,7 +136,7 @@ class RdsS3Backup < Thor
         exit(1)
       end
 
-      reqd_options = %w(rds_instance_id s3_bucket aws_access_key_id aws_secret_access_key mysql_database mysql_username mysql_password)
+      reqd_options = %w(rds_instance_id aws_access_key_id aws_secret_access_key mysql_database mysql_username mysql_password)
       nil_options = reqd_options.find_all{ |opt| merged_options[opt].nil?}
       if nil_options.count > 0
         puts "No value provided for required option(s) #{nil_options.join(' ')} in either config file or options."
@@ -129,14 +145,9 @@ class RdsS3Backup < Thor
       merged_options
     end
     
-    def cleanup(new_snap, backup_server, backup_file_filepath)
-      new_snap.wait_for { ready? }
-      new_snap.destroy
-      
+    def cleanup(backup_server)
       backup_server.wait_for { ready? }
       backup_server.destroy(nil)
-      
-      File.unlink(backup_file_filepath)
     end
     
     def prune_dumpfiles(s3_bucket, backup_file_prefix, dump_ttl)
